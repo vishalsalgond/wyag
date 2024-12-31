@@ -5,6 +5,7 @@ from datetime import datetime
 import grp, pwd
 import hashlib
 from math import ceil
+from fnmatch import fnmatch
 import os
 import re
 import sys
@@ -95,7 +96,6 @@ argsp.add_argument("-m", metavar="message", dest="message",
     help="Message to associate with this commit.")
 
 # Helper functions
-
 def main(argv=sys.argv[1:]):
     args = argparser.parse_args(argv)
     match args.command:
@@ -142,17 +142,16 @@ def repo_dir(repo, *path, make_directory=False):
 
 
 def repo_create(path):
-    """Create a new git repository at the given path"""
+    """Create a new wyag repository at the given path"""
 
     repo = GitRepository(path, force=True)
 
     if os.path.exists(repo.worktree):
         if not os.path.isdir(repo.worktree):
-            raise Exception("[ERROR]: {} is not a directory.".format(repo.worktree))
+            raise Exception("{} is not a directory.".format(repo.worktree))
         if os.path.exists(repo.gitdir) and os.listdir(repo.gitdir):
-            raise Exception("[ERROR: {} is already a git repository.".format(repo.worktree))
+            raise Exception("{} is already a wyag repository.".format(repo.worktree))
     else:
-        # TODO: check if we can use repo_dir here
         os.makedirs(repo.worktree)  
 
     # create the necessary directories
@@ -169,17 +168,34 @@ def repo_create(path):
     with open(repo_file(repo, "HEAD"), "w") as f:
         f.write("ref: refs/heads/master\n")
 
+    # .git/config
     with open(repo_file(repo, "config"), "w") as f:
         config = repo_default_config()
         config.write(f)
 
+    print("Initialized empty wyag repository in {}".format(os.path.abspath(path)))
+
 
 def repo_default_config():
+    """
+    [core]
+    repositoryformatversion = 0
+    filemode = false
+    bare = false
+    """
     ret = configparser.ConfigParser()
 
     ret.add_section("core")
+    # the version of the gitdir format. 0 means the initial format, 
+    # 1 means the same with extensions. If > 1, git will panic; 
+    # wyag will only accept 0
     ret.set("core", "repositoryformatversion", "0")
+
+    # disable tracking of file modes (permissions) changes in the work tree
     ret.set("core", "filemode", "false")
+
+    # indicates that this repository has a worktree. Git supports an optional worktree 
+    # key which indicates the location of the worktree, if not ..; wyag doesn’t
     ret.set("core", "bare", "false")
 
     return ret
@@ -196,16 +212,20 @@ def repo_find(path=".", required=True):
     # Base case for recursion
     if parent == path:
         if required:
-            raise Exception("[ERROR]: No git directory found.")
+            raise Exception("No wyag directory found.")
         else:
             return None
 
     return repo_find(parent, required)
 
 def object_read(repo, sha):
-    """Read the hashed object from the git repo. Return a 
-       GitObject whose exact type depends on the object."""
+    """
+    Read the hashed object from the git repo. Return a 
+    GitObject whose exact type depends on the object.
+    """
     
+    # In git, we take first two chars of the sha of the object
+    # to determine it's directory name
     path = repo_file(repo, "objects", sha[0:2], sha[2:])
 
     if not os.path.isfile(path):
@@ -213,6 +233,10 @@ def object_read(repo, sha):
     
     with open(path, "rb") as f:
         raw = zlib.decompress(f.read())
+
+    # Example of raw: b'commit 143\x00tree c84198e4065225efea8d3b4c03b8f636730e5d64\n
+    # author Vishal Salgond 1725820440 +0530\ncommitter Vishal Salgond 1725820440 +0530\n
+    # \ninitial commit\n'
 
     # Read object type
     type_end_index = raw.find(b' ')
@@ -224,7 +248,6 @@ def object_read(repo, sha):
     if size != len(raw) - size_end_index - 1:
         raise Exception("Malformed object {0}: Bad length".format(sha))
 
-    # print(fmt)
     # Find the constructor:
     match fmt:
         case b'commit' : constructor = GitCommit
@@ -241,9 +264,9 @@ def object_read(repo, sha):
 def object_write(obj, repo=None):
     # Serialize object data
     data = obj.serialize()
-    # print(obj.items[0].sha, data)
     # Add header
     result = obj.fmt + b' ' + str(len(data)).encode() + b'\x00' + data
+    # Example of result: b'blob 12\x00This is doc\n'
 
     # Compute hash (part 1 : dir + part 2 : name of the file)
     sha = hashlib.sha1(result).hexdigest()
@@ -258,6 +281,11 @@ def object_write(obj, repo=None):
     return sha
 
 def object_find(repo, name, fmt=None, follow=True):
+    """
+    If we have a tag and fmt is anything else, we follow the tag.
+    If we have a commit and fmt is tree, we return this commit's tree object
+    In all other situations, we bail out: nothing else makes sense.
+    """
     sha = object_resolve(repo, name)
 
     if not sha:
@@ -271,7 +299,6 @@ def object_find(repo, name, fmt=None, follow=True):
         return sha
 
     while True:
-        # print("Resolved sha: ", sha)
         obj = object_read(repo, sha)
 
         if obj.fmt == fmt:
@@ -293,7 +320,9 @@ def cat_file(repo, obj, fmt=None):
     obj = object_read(repo, object_find(repo, obj, fmt=fmt))
     sys.stdout.buffer.write(obj.serialize())
 
+
 def object_hash(fd, fmt, repo=None):
+    """ Hash object, writing it to repo if provided."""
     data = fd.read()
 
     match fmt:
@@ -305,6 +334,7 @@ def object_hash(fd, fmt, repo=None):
 
     return object_write(obj, repo) 
 
+
 def kvlm_parse(raw, start=0, dct=None):
     if not dct:
         dct = collections.OrderedDict()
@@ -313,7 +343,12 @@ def kvlm_parse(raw, start=0, dct=None):
     spc = raw.find(b' ', start)
     nl = raw.find(b'\n', start)
 
-    # Base case - read the commit message
+    # Base case
+    # =========
+    # If newline appears first (or there's no space at all, in which
+    # case find returns -1), we assume a blank line.  A blank line
+    # means the remainder of the data is the message.  We store it in
+    # the dictionary, with None as the key, and return.
     if (spc < 0) or (nl < spc):
         assert nl == start
         dct[None] = raw[start + 1:]
@@ -366,6 +401,7 @@ def kvlm_serialize(kvlm):
 def log_graphviz(repo, sha, seen):
     if sha in seen:
         return
+
     seen.add(sha)
 
     commit = object_read(repo, sha)
@@ -378,9 +414,11 @@ def log_graphviz(repo, sha, seen):
     if "\n" in message:
         message = message[:message.index("\n")]
 
-    print(" commit {0} [label=\"{1}: {2}\"]".format(sha, sha[0:7], message))
-    print(" Author: {}".format(commit.kvlm[b'author']))
-    print("     {}".format(message))
+    print(" commit {0}".format(sha))
+    print(" Author: {}".format(commit.kvlm[b'author'].decode("utf8")))
+    print(" Date: {}".format(commit.kvlm[b'date'].decode("utf8")))
+    print("\n     {}".format(message))
+    print()
     assert commit.fmt == b'commit'
 
     # Base case: Initial commit
@@ -392,15 +430,18 @@ def log_graphviz(repo, sha, seen):
     if type(parents) != list:
         parents = [parents]
     
-    print()
-
     for p in parents:
         p = p.decode("ascii")
-        print(" c_{0} -> c{1}".format(sha, p))
+        # print(" c_{0} -> c{1}".format(sha, p))
         log_graphviz(repo, p, seen)
 
 
 def tree_parse_one(raw, start=0):
+    """
+    Parser to extract a single record, returns the position it reached in input data
+    and the parsed data as GitTreeLeaf object
+    """
+
     x = raw.find(b' ', start)
     assert x - start == 5 or x - start == 6
 
@@ -420,6 +461,10 @@ def tree_parse_one(raw, start=0):
 
 
 def tree_parse(raw):
+    """
+    Parse the tree by calling tree_parse_one in a loop, until input data is exhausted
+    tree structure: [mode] space [path] 0x00 [sha-1]
+    """
     pos = 0
     max_pos = len(raw)
     res = list()
@@ -431,12 +476,23 @@ def tree_parse(raw):
     return res
     
 def tree_leaf_sort_key(leaf):
+    """
+    This isn't a comparison function, but a conversion function.
+    Python's default sort doesn't accept a custom comparison function,
+    like in most languages, but a `key` arguments that returns a new
+    value, which is compared using the default rules.  
+    So we just return the leaf name, with an extra / if it's a directory. 
+    """
+
     if leaf.mode.startswith(b"10"):
         return leaf.path
     else:
         return leaf.path + "/"
 
 def tree_serialize(obj):
+    """
+    Sorts the leaf items and writes them in order
+    """
     obj.items.sort(key=tree_leaf_sort_key)
     res = b''
 
@@ -469,7 +525,7 @@ def ls_tree(repo, ref, recursive=None, prefix=""):
         match type:
             case b'04': type = "tree" # TODO: check if this should be leaf
             case b'10': type = "blob" # A regular file
-            case b'12': type = "blob" # A symlink (TODO)
+            case b'12': type = "blob" # A symlink
             case b'16': type = "commit"
             case _: raise Exception("Unexpected tree leaf node {}".format(item.mode))
 
@@ -485,6 +541,10 @@ def ls_tree(repo, ref, recursive=None, prefix=""):
 
 
 def tree_checkout(repo, tree, path):
+    """
+    Takes two arguments: a commit, and a directory
+    Instantiates the tree in the directory, if and only if the directory is empty
+    """
     for item in tree.items:
         obj = object_read(repo, item.sha)
         dest = os.path.join(path, item.path)
@@ -552,7 +612,7 @@ def tag_create(repo, name, ref, create_tag_object=False):
         tag.kvlm[b'type'] = b'commit'
         tag.kvlm[b'tag'] = name.encode()
         tag.kvlm[b'tagger'] = b'user <user@example.com>'
-        tag.kvlm[None] = b"A tag generated by user, you cannot currently add custom message!" # TODO
+        tag.kvlm[None] = b"A tag generated by user, you cannot currently add custom message!"
         tag_sha = object_write(tag)
 
         ref_create(repo, "tags/" + name, tag_sha)
@@ -566,7 +626,8 @@ def ref_create(repo, ref_name, sha):
         fp.write(sha + "\n")
 
 def object_resolve(repo, name):
-    """Resolve name to an object hash in the repo.
+    """
+    Resolve name to an object hash in the repo.
     The function can resolve:
     - the HEAD literal
     - short and long hashes
@@ -712,9 +773,8 @@ def gitignore_parse(lines):
 
     return ret
 
-# TODO
 def gitignore_read(repo):
-    ret = GitIgnore(absolute=list(), scoped=list())
+    ret = GitIgnore(absolute=list(), scoped=dict())
 
     # Read local configuration in .git/info/exclude
     repo_file = os.path.join(repo.gitdir, "info/exclude")
@@ -739,8 +799,8 @@ def gitignore_read(repo):
     for entry in index.entries:
         if entry.name == ".gitignore" or entry.name.endswith("./gitignore"):
             dir_name = os.path.dirname(entry.name)
-            contents = object_read(entry.name)
-            lines = contents.blobdata("utf8").splitlines()
+            contents = object_read(repo, entry.sha)
+            lines = contents.blobdata.decode("utf8").splitlines()
             ret.scoped[dir_name] = gitignore_parse(lines)
 
     return ret
@@ -821,7 +881,11 @@ def tree_to_dict(repo, ref, prefix=""):
 def cmd_status_head_index(repo, index):
     print("Changes to be committed:")
 
-    head = tree_to_dict(repo, "HEAD")
+    try:
+        head = tree_to_dict(repo, "HEAD")
+    except:
+        head = dict() # No commits yet
+
     for entry in index.entries:
         if entry.name in head:
             if head[entry.name] != entry.sha:
@@ -844,7 +908,7 @@ def cmd_status_index_worktree(repo, index):
 
     # Walk the filesystem and find out all the files
     for (root, _, files) in os.walk(repo.worktree, True):
-        if root == repo.gitdir or root.startswith(gitdir_prefix):   # TODO
+        if root == repo.gitdir or root.startswith(gitdir_prefix):
             continue
 
         for f in files:
@@ -874,6 +938,7 @@ def cmd_status_index_worktree(repo, index):
             all_files.remove(entry.name)
     
     print("\nUntracked files: ")
+    print('(use "wyag add <file>..." to include in what will be committed)')
     for f in all_files:
         if not check_ignore(ignore, f):
             print(" ", f)
@@ -881,11 +946,11 @@ def cmd_status_index_worktree(repo, index):
 def index_write(repo, index):
     endianness = "big"
     with open(repo_file(repo, "index"), "wb") as f:
-        # Write the magic bytes
+        # A 4-byte ASCII string DIRC, indicating a directory cache.
         f.write(b"DIRC")
-        # Write the version number
+        # 4 bytes indicating the format version (usually 2, 3, or 4).
         f.write(index.version.to_bytes(4, endianness))
-        # Write the number of entries
+        # 4 bytes representing the number of entries in the index.
         f.write(len(index.entries).to_bytes(4, endianness))
 
         idx = 0
@@ -897,7 +962,7 @@ def index_write(repo, index):
             f.write(e.dev.to_bytes(4, endianness))
             f.write(e.ino.to_bytes(4, endianness))
 
-            # Mode
+            # Mode: Indicates the type of file (e.g., blob, symlink, executable).
             mode = (e.mode_type << 12) | e.mode_perms
             f.write(mode.to_bytes(4, endianness))
 
@@ -1011,8 +1076,8 @@ def gitconfig_read():
     xdg_config_home = os.environ["XDG_CONFIG_HOME"] if "XDG_CONFIG_HOME" in os.environ else "~/.config"
     configfiles = [
         os.path.expanduser(os.path.join(xdg_config_home, "git/config")),
-        os.path.expanduser("~/..gitconfig")
-    ] # TODO
+        os.path.expanduser("~/.gitconfig")
+    ]
 
     config = configparser.ConfigParser()
     config.read(configfiles)
@@ -1071,7 +1136,7 @@ def tree_from_index(repo, index):
 
 def commit_create(repo, tree, parent, author, timestamp, message):
     if author == None:
-        author = "Vishal Salgond" # TODO
+        author = "None"
 
     commit = GitCommit()
     commit.kvlm[b"tree"] = tree.encode("ascii")
@@ -1083,10 +1148,11 @@ def commit_create(repo, tree, parent, author, timestamp, message):
     minutes = (offset % 3600) // 60
     tz = "{}{:02}{:02}".format("+" if offset > 0 else "-", hours, minutes)
 
-    author = author + timestamp.strftime(" %s ") + tz
+    date = datetime.now().strftime('%a %b %d %H:%M:%S %Y %z') + " " + tz
 
     commit.kvlm[b"author"] = author.encode("utf8")
     commit.kvlm[b"committer"] = author.encode("utf8")
+    commit.kvlm[b"date"] = date.encode("utf8")
     commit.kvlm[None] = message.encode("utf8")
 
     return object_write(commit, repo)
@@ -1105,7 +1171,7 @@ class GitRepository(object):
         self.gitdir = os.path.join(path, ".git")
 
         if not (force or os.path.isdir(self.gitdir)):
-            raise Exception("[ERROR]: {} is not a git repository.".format(path))
+            raise Exception("{} is not a git repository.".format(path))
 
         self.conf = configparser.ConfigParser()
         cf = repo_file(self, "config")
@@ -1113,12 +1179,12 @@ class GitRepository(object):
         if cf and os.path.exists(cf):
             self.conf.read([cf])
         elif not force:
-            raise Exception("[ERROR]: Configuration file is missing.")
+            raise Exception("Configuration file is missing.")
 
         if not force:
             ver = int(self.conf.get("core", "repositoryformatversion"))
             if ver != 0:
-                raise Exception("[ERROR]: The repositoryformatversion {} is not supported.".format(ver))
+                raise Exception("The repositoryformatversion {} is not supported.".format(ver))
 
 class GitObject(object):
     
@@ -1275,10 +1341,10 @@ def cmd_hash_object(args):
 def cmd_log(args):
     repo = repo_find()
 
-    print("digraph wyaglog{")
-    print("  node[shape=rect]")
+    # print("digraph wyaglog{")
+    # print("  node[shape=rect]")
     log_graphviz(repo, object_find(repo, args.commit), set())
-    print("}")
+    # print("}")
 
 
 #############################################################
@@ -1286,7 +1352,7 @@ def cmd_log(args):
 # usage: wyag ls-tree [-r] TREE
 #############################################################
 
-def cmf_ls_tree(args):
+def cmd_ls_tree(args):
     repo = repo_find()
     ls_tree(repo, args.tree, args.recursive)
 
@@ -1333,13 +1399,18 @@ def cmd_show_ref(args):
 #############################################################
 
 def cmd_tag(args):
+    """
+    The cmd_tag function will dispatch behavior (list or create) 
+    depending on whether or not name is provided.
+    """
     repo = repo_find()
 
     if args.name:
-        tag_create(repo, args.name, args.object,
-            type="object" if args.create_tag_object else "ref")
+        tag_create(repo, args.name, args.object)
+            # type="object" if args.create_tag_object else "ref")
     else:
         refs = ref_list(repo)
+        # print(refs)
         show_ref(repo, refs["tags"], with_hash=False)
 
 
@@ -1409,8 +1480,8 @@ def cmd_check_ignore(args):
 
 
 #############################################################
-# wyag check-ignore
-# usage: wyag check-ignore [path]
+# wyag status
+# usage: wyag status
 #############################################################
 
 def cmd_status(_):
